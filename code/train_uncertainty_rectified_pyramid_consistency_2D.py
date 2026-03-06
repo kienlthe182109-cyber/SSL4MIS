@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
@@ -29,7 +28,7 @@ parser.add_argument("--root_path", type=str, default="../data/ACDC", help="datas
 parser.add_argument(
     "--exp",
     type=str,
-    default="ACDC/URPC_DynamicWeighted_Consistency",
+    default="ACDC/URPC_TrainFileOnly_Improved",
     help="experiment name",
 )
 parser.add_argument("--model", type=str, default="unet_urpc", help="model name")
@@ -55,13 +54,15 @@ parser.add_argument("--conf_rampup", type=float, default=50.0, help="confidence 
 
 # dynamic weighting
 parser.add_argument("--sup_decay", type=float, default=0.3, help="how much supervised weight decays")
-parser.add_argument("--feat_ramp_multiplier", type=float, default=2.0, help="feature ramp-up slower than output consistency")
 
 # uncertainty penalty
 parser.add_argument("--uncertainty_penalty", type=float, default=0.1, help="weight for variance penalty")
 
-# optional feature consistency
-parser.add_argument("--feat_weight_max", type=float, default=0.05, help="maximum feature consistency weight")
+# dual-view consistency
+parser.add_argument("--dual_consistency_weight", type=float, default=0.05, help="weight for noisy-view consistency")
+parser.add_argument("--noise_std", type=float, default=0.1, help="std of gaussian noise for second view")
+parser.add_argument("--noise_clip", type=float, default=0.2, help="clip range for gaussian noise")
+
 args = parser.parse_args()
 
 
@@ -87,7 +88,7 @@ def patients_to_slices(dataset, patients_num):
             "42": 623,
         }
     else:
-        raise ValueError("Unknown dataset for patients_to_slices")
+        raise ValueError("Unknown dataset")
     return ref_dict[str(patients_num)]
 
 
@@ -111,60 +112,13 @@ def get_output_consistency_scale(epoch):
     return ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
-def get_feature_consistency_scale(epoch):
-    return ramps.sigmoid_rampup(epoch, args.consistency_rampup * args.feat_ramp_multiplier)
-
-
-def normalize_feature(feat):
-    return F.normalize(feat, p=2, dim=1)
-
-
-def extract_outputs_and_feats(model_out):
+def unpack_outputs(model_out):
     """
-    Compatible with:
-    1) old URPC model: returns 4 outputs
-    2) extended model: returns 4 outputs + extra feature tensors
+    Only support current unet_urpc style: 4 outputs
     """
-    if not isinstance(model_out, (tuple, list)):
-        raise ValueError("Model output must be tuple/list for URPC training")
-
-    if len(model_out) < 4:
-        raise ValueError("Model must return at least 4 outputs: main + 3 aux heads")
-
-    outputs = model_out[:4]
-    feats = list(model_out[4:]) if len(model_out) > 4 else []
-    return outputs, feats
-
-
-def compute_feature_loss(feats):
-    """
-    Optional feature consistency.
-    If model returns >= 2 feature tensors, match adjacent feature maps.
-    Works as a lightweight regularizer and does not break old models.
-    """
-    if feats is None or len(feats) < 2:
-        return None
-
-    norm_feats = [normalize_feature(f) for f in feats]
-    feat_loss = 0.0
-    pair_count = 0
-
-    for i in range(len(norm_feats) - 1):
-        f1 = norm_feats[i]
-        f2 = norm_feats[i + 1]
-
-        # align spatial size if needed
-        if f1.shape[-2:] != f2.shape[-2:]:
-            f2 = F.interpolate(f2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-
-        # align channels if needed by slicing to min channel count
-        c = min(f1.shape[1], f2.shape[1])
-        feat_loss = feat_loss + F.mse_loss(f1[:, :c], f2[:, :c])
-        pair_count += 1
-
-    if pair_count == 0:
-        return None
-    return feat_loss / pair_count
+    if not isinstance(model_out, (tuple, list)) or len(model_out) != 4:
+        raise ValueError("Current train-file-only version expects model to return exactly 4 outputs.")
+    return model_out[0], model_out[1], model_out[2], model_out[3]
 
 
 def train(args, snapshot_path):
@@ -174,7 +128,6 @@ def train(args, snapshot_path):
     max_iterations = args.max_iterations
 
     model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes)
-    model.train()
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -189,7 +142,7 @@ def train(args, snapshot_path):
 
     total_slices = len(db_train)
     labeled_slice = patients_to_slices(args.root_path, args.labeled_num)
-    print(f"Total slices: {total_slices}, labeled slices: {labeled_slice}")
+    print("Total slices: {}, labeled slices: {}".format(total_slices, labeled_slice))
 
     labeled_idxs = list(range(0, labeled_slice))
     unlabeled_idxs = list(range(labeled_slice, total_slices))
@@ -207,6 +160,7 @@ def train(args, snapshot_path):
 
     valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=1)
 
+    model.train()
     optimizer = optim.SGD(
         model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001
     )
@@ -217,7 +171,7 @@ def train(args, snapshot_path):
     kl_distance = nn.KLDivLoss(reduction="none")
 
     writer = SummaryWriter(snapshot_path + "/log")
-    logging.info(f"{len(trainloader)} iterations per epoch")
+    logging.info("{} iterations per epoch".format(len(trainloader)))
 
     iter_num = 0
     max_epoch = max_iterations // len(trainloader) + 1
@@ -229,17 +183,32 @@ def train(args, snapshot_path):
             volume_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            model_out = model(volume_batch)
-            outputs_list, feats = extract_outputs_and_feats(model_out)
-            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = outputs_list
+            lb = args.labeled_bs
+
+            # ---------------- main forward ----------------
+            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = unpack_outputs(model(volume_batch))
 
             outputs_soft = torch.softmax(outputs, dim=1)
             outputs_aux1_soft = torch.softmax(outputs_aux1, dim=1)
             outputs_aux2_soft = torch.softmax(outputs_aux2, dim=1)
             outputs_aux3_soft = torch.softmax(outputs_aux3, dim=1)
 
+            # ---------------- second noisy-view forward (train-file-only "teacher-like" target) ----------------
+            noise = torch.clamp(
+                torch.randn_like(volume_batch) * args.noise_std,
+                -args.noise_clip,
+                args.noise_clip,
+            )
+            volume_batch_noise = volume_batch + noise
+
+            with torch.no_grad():
+                outputs_t, outputs_aux1_t, outputs_aux2_t, outputs_aux3_t = unpack_outputs(model(volume_batch_noise))
+                outputs_t_soft = torch.softmax(outputs_t, dim=1)
+                outputs_aux1_t_soft = torch.softmax(outputs_aux1_t, dim=1)
+                outputs_aux2_t_soft = torch.softmax(outputs_aux2_t, dim=1)
+                outputs_aux3_t_soft = torch.softmax(outputs_aux3_t, dim=1)
+
             # ---------------- supervised loss ----------------
-            lb = args.labeled_bs
             label_l = label_batch[:lb]
 
             loss_ce = ce_loss(outputs[:lb], label_l.long())
@@ -257,13 +226,12 @@ def train(args, snapshot_path):
 
             supervised_loss = (0.2 * ce_sum + 0.8 * dice_sum) / 4.0
 
-            # ---------------- unlabeled pseudo target ----------------
+            # ---------------- ensemble pseudo target ----------------
             preds = (
                 outputs_soft + outputs_aux1_soft + outputs_aux2_soft + outputs_aux3_soft
             ) / 4.0
-            preds = preds.detach()  # pseudo target as target, not source of unstable gradients
+            preds = preds.detach()
 
-            # unlabeled part
             preds_u = preds[lb:]
             outputs_u = outputs_soft[lb:]
             outputs_aux1_u = outputs_aux1_soft[lb:]
@@ -278,7 +246,7 @@ def train(args, snapshot_path):
                 mask_mean = conf_mask.mean()
                 norm_factor = mask_mean + 1e-6
 
-            # ---------------- variance-aware weighting ----------------
+            # ---------------- variance-aware output consistency ----------------
             variance_main = torch.sum(
                 kl_distance(torch.log(outputs_u + 1e-8), preds_u),
                 dim=1,
@@ -343,61 +311,68 @@ def train(args, snapshot_path):
                 + consistency_loss_aux3
             ) / 4.0
 
-            # ---------------- optional feature consistency ----------------
-            feat_loss = compute_feature_loss(feats)
-            if feat_loss is None:
-                feat_loss = torch.tensor(0.0, device=volume_batch.device)
+            # ---------------- dual-view consistency (train file only, no model change) ----------------
+            outputs_t_u = outputs_t_soft[lb:]
+            outputs_aux1_t_u = outputs_aux1_t_soft[lb:]
+            outputs_aux2_t_u = outputs_aux2_t_soft[lb:]
+            outputs_aux3_t_u = outputs_aux3_t_soft[lb:]
+
+            dual_consistency_main = torch.mean(((outputs_u - outputs_t_u) ** 2) * conf_mask) / norm_factor
+            dual_consistency_aux1 = torch.mean(((outputs_aux1_u - outputs_aux1_t_u) ** 2) * conf_mask) / norm_factor
+            dual_consistency_aux2 = torch.mean(((outputs_aux2_u - outputs_aux2_t_u) ** 2) * conf_mask) / norm_factor
+            dual_consistency_aux3 = torch.mean(((outputs_aux3_u - outputs_aux3_t_u) ** 2) * conf_mask) / norm_factor
+
+            dual_view_loss = (
+                dual_consistency_main
+                + dual_consistency_aux1
+                + dual_consistency_aux2
+                + dual_consistency_aux3
+            ) / 4.0
 
             # ---------------- dynamic weighting ----------------
             sup_weight = get_supervised_weight(epoch_num, max_epoch)
             out_scale = get_output_consistency_scale(epoch_num)
-            feat_scale = get_feature_consistency_scale(epoch_num)
-
             consistency_weight = get_current_consistency_weight(epoch_num)
-            feat_weight = args.feat_weight_max * feat_scale
 
             loss = (
                 sup_weight * supervised_loss
                 + out_scale * consistency_weight * consistency_loss
-                + feat_weight * feat_loss
+                + args.dual_consistency_weight * out_scale * dual_view_loss
             )
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # cosine lr
+            # ---------------- cosine lr ----------------
             lr_ = base_lr * (1.0 + math.cos(math.pi * iter_num / max_iterations)) / 2.0
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_
 
             iter_num += 1
 
-            # logs
+            # ---------------- logs ----------------
             writer.add_scalar("info/lr", lr_, iter_num)
             writer.add_scalar("info/total_loss", loss.item(), iter_num)
             writer.add_scalar("info/supervised_loss", supervised_loss.item(), iter_num)
-            writer.add_scalar("info/loss_ce", loss_ce.item(), iter_num)
-            writer.add_scalar("info/loss_dice", loss_dice.item(), iter_num)
             writer.add_scalar("info/consistency_loss", consistency_loss.item(), iter_num)
+            writer.add_scalar("info/dual_view_loss", dual_view_loss.item(), iter_num)
             writer.add_scalar("info/consistency_weight", consistency_weight, iter_num)
             writer.add_scalar("info/sup_weight", sup_weight, iter_num)
             writer.add_scalar("info/out_scale", out_scale, iter_num)
-            writer.add_scalar("info/feat_scale", feat_scale, iter_num)
-            writer.add_scalar("info/feat_weight", feat_weight, iter_num)
-            writer.add_scalar("info/feat_loss", feat_loss.item(), iter_num)
             writer.add_scalar("info/conf_thresh", conf_thresh, iter_num)
             writer.add_scalar("info/mask_ratio", mask_mean.item(), iter_num)
-            writer.add_scalar("info/uncertainty_penalty", args.uncertainty_penalty, iter_num)
+            writer.add_scalar("info/loss_ce", loss_ce.item(), iter_num)
+            writer.add_scalar("info/loss_dice", loss_dice.item(), iter_num)
 
             logging.info(
-                "iter %d | total %.4f | sup %.4f | cons %.4f | feat %.4f | ce %.4f | dice %.4f"
+                "iter %d | total %.4f | sup %.4f | cons %.4f | dual %.4f | ce %.4f | dice %.4f"
                 % (
                     iter_num,
                     loss.item(),
                     supervised_loss.item(),
                     consistency_loss.item(),
-                    feat_loss.item(),
+                    dual_view_loss.item(),
                     loss_ce.item(),
                     loss_dice.item(),
                 )
@@ -428,18 +403,19 @@ def train(args, snapshot_path):
 
                 for class_i in range(num_classes - 1):
                     writer.add_scalar(
-                        f"info/val_{class_i + 1}_dice",
+                        "info/val_{}_dice".format(class_i + 1),
                         metric_list[class_i, 0],
                         iter_num,
                     )
                     writer.add_scalar(
-                        f"info/val_{class_i + 1}_hd95",
+                        "info/val_{}_hd95".format(class_i + 1),
                         metric_list[class_i, 1],
                         iter_num,
                     )
 
                 performance = np.mean(metric_list, axis=0)[0]
                 mean_hd95 = np.mean(metric_list, axis=0)[1]
+
                 writer.add_scalar("info/val_mean_dice", performance, iter_num)
                 writer.add_scalar("info/val_mean_hd95", mean_hd95, iter_num)
 
@@ -447,9 +423,9 @@ def train(args, snapshot_path):
                     best_performance = performance
                     save_mode_path = os.path.join(
                         snapshot_path,
-                        f"iter_{iter_num}_dice_{round(best_performance, 4)}.pth",
+                        "iter_{}_dice_{}.pth".format(iter_num, round(best_performance, 4)),
                     )
-                    save_best = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
+                    save_best = os.path.join(snapshot_path, "{}_best_model.pth".format(args.model))
                     torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
 
@@ -460,9 +436,9 @@ def train(args, snapshot_path):
                 model.train()
 
             if iter_num % 3000 == 0:
-                save_mode_path = os.path.join(snapshot_path, f"iter_{iter_num}.pth")
+                save_mode_path = os.path.join(snapshot_path, "iter_{}.pth".format(iter_num))
                 torch.save(model.state_dict(), save_mode_path)
-                logging.info(f"save model to {save_mode_path}")
+                logging.info("save model to {}".format(save_mode_path))
 
             if iter_num >= max_iterations:
                 break
