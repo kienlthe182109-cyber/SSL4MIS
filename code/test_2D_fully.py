@@ -130,7 +130,7 @@ def Inference(FLAGS):
 
     db_test = BaseDataSets(
         base_dir=FLAGS.root_path,
-        split="test"
+        split="val"
     )
 
     testloader = DataLoader(
