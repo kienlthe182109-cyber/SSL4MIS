@@ -1,120 +1,171 @@
 import argparse
 import os
-import shutil
-
-import h5py
-import nibabel as nib
 import numpy as np
-import SimpleITK as sitk
 import torch
-from medpy import metric
-from scipy.ndimage import zoom
+import torch.nn.functional as F
 from tqdm import tqdm
-
-# from networks.efficientunet import UNet
+from medpy import metric
 from networks.net_factory import net_factory
+from dataloaders.dataset import BaseDataSets
+from torch.utils.data import DataLoader
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--root_path", type=str, default="../data/ACDC", help="Name of Experiment"
-)
-parser.add_argument(
-    "--exp", type=str, default="ACDC/Fully_Supervised", help="experiment_name"
-)
-parser.add_argument("--model", type=str, default="unet", help="model_name")
-parser.add_argument(
-    "--num_classes", type=int, default=4, help="output channel of network"
-)
-parser.add_argument("--labeled_num", type=int, default=3, help="labeled data")
+parser.add_argument('--root_path', type=str,
+                    default='../data/ACDC', help='dataset path')
+parser.add_argument('--exp', type=str,
+                    default='ACDC/Uncertainty_Rectified_Pyramid_Consistency')
+parser.add_argument('--model', type=str,
+                    default='unet_urpc', help='model_name')
+parser.add_argument('--num_classes', type=int,
+                    default=4, help='output channel of network')
+parser.add_argument('--labeled_num', type=int, default=7)
+parser.add_argument('--batch_size', type=int, default=1)
+FLAGS = parser.parse_args()
 
 
 def calculate_metric_percase(pred, gt):
+    """
+    Safe metric calculation.
+    Handles empty masks to avoid MedPy crash.
+    """
+    pred = pred.astype(np.uint8)
+    gt = gt.astype(np.uint8)
+
     pred[pred > 0] = 1
     gt[gt > 0] = 1
+
+    pred_sum = pred.sum()
+    gt_sum = gt.sum()
+
+    # case 1: both empty
+    if pred_sum == 0 and gt_sum == 0:
+        return 1.0, 0.0, 0.0
+
+    # case 2: prediction empty but gt not
+    if pred_sum == 0 and gt_sum > 0:
+        return 0.0, 100.0, 100.0
+
+    # case 3: gt empty but prediction not
+    if pred_sum > 0 and gt_sum == 0:
+        return 0.0, 100.0, 100.0
+
+    # normal case
     dice = metric.binary.dc(pred, gt)
-    asd = metric.binary.asd(pred, gt)
     hd95 = metric.binary.hd95(pred, gt)
+    asd = metric.binary.asd(pred, gt)
+
     return dice, hd95, asd
 
 
-def test_single_volume(case, net, test_save_path, FLAGS):
-    h5f = h5py.File(FLAGS.root_path + "/data/{}.h5".format(case), "r")
-    image = h5f["image"][:]
-    label = h5f["label"][:]
+def test_single_volume(image, label, net, classes):
+    image = image.squeeze(0).cpu().numpy()
+    label = label.squeeze(0).cpu().numpy()
+
     prediction = np.zeros_like(label)
+
     for ind in range(image.shape[0]):
         slice = image[ind, :, :]
-        x, y = slice.shape[0], slice.shape[1]
-        slice = zoom(slice, (256 / x, 256 / y), order=0)
         input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
-        net.eval()
+
         with torch.no_grad():
-            out_main = net(input)
-            if isinstance(out_main, (tuple, list)):
-                out_main = out_main[0]
+            out = net(input)
 
-            out = torch.argmax(torch.softmax(out_main, dim=1), dim=1).squeeze(0)
-            out = out.cpu().detach().numpy()
-            pred = zoom(out, (x / 256, y / 256), order=0)
-            prediction[ind] = pred
+            # handle multi-output models
+            if isinstance(out, (tuple, list)):
+                out = out[0]
 
-    first_metric = calculate_metric_percase(prediction == 1, label == 1)
-    second_metric = calculate_metric_percase(prediction == 2, label == 2)
-    third_metric = calculate_metric_percase(prediction == 3, label == 3)
+            out = torch.argmax(
+                torch.softmax(out, dim=1),
+                dim=1
+            ).squeeze(0)
 
-    img_itk = sitk.GetImageFromArray(image.astype(np.float32))
-    img_itk.SetSpacing((1, 1, 10))
-    prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
-    prd_itk.SetSpacing((1, 1, 10))
-    lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
-    lab_itk.SetSpacing((1, 1, 10))
-    sitk.WriteImage(prd_itk, test_save_path + case + "_pred.nii.gz")
-    sitk.WriteImage(img_itk, test_save_path + case + "_img.nii.gz")
-    sitk.WriteImage(lab_itk, test_save_path + case + "_gt.nii.gz")
+        prediction[ind] = out.cpu().numpy()
+
+    first_metric = calculate_metric_percase(
+        prediction == 1,
+        label == 1
+    )
+    second_metric = calculate_metric_percase(
+        prediction == 2,
+        label == 2
+    )
+    third_metric = calculate_metric_percase(
+        prediction == 3,
+        label == 3
+    )
+
     return first_metric, second_metric, third_metric
 
 
 def Inference(FLAGS):
-    with open(FLAGS.root_path + "/test.list", "r") as f:
-        image_list = f.readlines()
-    image_list = sorted([item.replace("\n", "").split(".")[0] for item in image_list])
-    snapshot_path = "../model/{}_{}_labeled/{}".format(
-        FLAGS.exp, FLAGS.labeled_num, FLAGS.model
+
+    snapshot_path = "../model/{}_{}_labeled/{}/".format(
+        FLAGS.exp,
+        FLAGS.labeled_num,
+        FLAGS.model
     )
-    test_save_path = "../model/{}_{}_labeled/{}_predictions/".format(
-        FLAGS.exp, FLAGS.labeled_num, FLAGS.model
+
+    num_classes = FLAGS.num_classes
+
+    test_save_path = "../model/predictions/"
+    if not os.path.exists(test_save_path):
+        os.makedirs(test_save_path)
+
+    net = net_factory(
+        net_type=FLAGS.model,
+        in_chns=1,
+        class_num=num_classes
     )
-    if os.path.exists(test_save_path):
-        shutil.rmtree(test_save_path)
-    os.makedirs(test_save_path)
-    net = net_factory(net_type=FLAGS.model, in_chns=1, class_num=FLAGS.num_classes)
+
     save_mode_path = os.path.join(
-        snapshot_path, "{}_best_model.pth".format(FLAGS.model)
+        snapshot_path,
+        '{}_best_model.pth'.format(FLAGS.model)
     )
+
     net.load_state_dict(torch.load(save_mode_path))
     print("init weight from {}".format(save_mode_path))
+
     net.eval()
 
-    first_total = 0.0
-    second_total = 0.0
-    third_total = 0.0
-    for case in tqdm(image_list):
+    db_test = BaseDataSets(
+        base_dir=FLAGS.root_path,
+        split="test"
+    )
+
+    testloader = DataLoader(
+        db_test,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1
+    )
+
+    metric_list = 0.0
+
+    for sampled_batch in tqdm(testloader):
+        image = sampled_batch["image"]
+        label = sampled_batch["label"]
+
+        image, label = image.cuda(), label.cuda()
+
         first_metric, second_metric, third_metric = test_single_volume(
-            case, net, test_save_path, FLAGS
+            image,
+            label,
+            net,
+            classes=num_classes
         )
-        first_total += np.asarray(first_metric)
-        second_total += np.asarray(second_metric)
-        third_total += np.asarray(third_metric)
-    avg_metric = [
-        first_total / len(image_list),
-        second_total / len(image_list),
-        third_total / len(image_list),
-    ]
-    return avg_metric
+
+        metric_list += np.array(
+            (first_metric, second_metric, third_metric)
+        )
+
+    metric_list = metric_list / len(db_test)
+
+    print("Mean metrics:")
+    print(metric_list)
+
+    return metric_list
 
 
-if __name__ == "__main__":
-    FLAGS = parser.parse_args()
+if __name__ == '__main__':
     metric = Inference(FLAGS)
-    print(metric)
-    print((metric[0] + metric[1] + metric[2]) / 3)
