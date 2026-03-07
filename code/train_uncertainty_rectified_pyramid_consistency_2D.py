@@ -28,7 +28,7 @@ parser.add_argument("--root_path", type=str, default="../data/ACDC", help="datas
 parser.add_argument(
     "--exp",
     type=str,
-    default="ACDC/URPC_TrainFileOnly_Improved",
+    default="ACDC/URPC_ClassAware_Entropy",
     help="experiment name",
 )
 parser.add_argument("--model", type=str, default="unet_urpc", help="model name")
@@ -48,10 +48,6 @@ parser.add_argument("--labeled_num", type=int, default=7, help="number of labele
 parser.add_argument("--consistency", type=float, default=0.1, help="maximum consistency weight")
 parser.add_argument("--consistency_rampup", type=float, default=200.0, help="consistency rampup")
 
-# confidence masking
-parser.add_argument("--conf_thresh", type=float, default=0.7, help="final confidence threshold")
-parser.add_argument("--conf_rampup", type=float, default=50.0, help="confidence threshold rampup")
-
 # dynamic weighting
 parser.add_argument("--sup_decay", type=float, default=0.3, help="how much supervised weight decays")
 
@@ -62,6 +58,16 @@ parser.add_argument("--uncertainty_penalty", type=float, default=0.1, help="weig
 parser.add_argument("--dual_consistency_weight", type=float, default=0.05, help="weight for noisy-view consistency")
 parser.add_argument("--noise_std", type=float, default=0.1, help="std of gaussian noise for second view")
 parser.add_argument("--noise_clip", type=float, default=0.2, help="clip range for gaussian noise")
+
+# entropy minimization
+parser.add_argument("--entropy_weight", type=float, default=0.005, help="weight for entropy minimization on unlabeled data")
+
+# class-aware thresholding
+parser.add_argument("--bg_thresh", type=float, default=0.8, help="threshold for background")
+parser.add_argument("--rv_thresh", type=float, default=0.7, help="threshold for RV")
+parser.add_argument("--myo_thresh", type=float, default=0.6, help="threshold for MYO")
+parser.add_argument("--lv_thresh", type=float, default=0.7, help="threshold for LV")
+parser.add_argument("--class_thresh_rampup", type=float, default=50.0, help="rampup for class thresholds from relaxed to target")
 
 args = parser.parse_args()
 
@@ -96,13 +102,6 @@ def get_current_consistency_weight(epoch):
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
-def get_current_conf_threshold(epoch):
-    start = 0.5
-    end = float(args.conf_thresh)
-    ramp = ramps.sigmoid_rampup(epoch, args.conf_rampup)
-    return start + (end - start) * ramp
-
-
 def get_supervised_weight(epoch, max_epoch):
     progress = min(epoch / max_epoch, 1.0)
     return 1.0 - args.sup_decay * progress
@@ -112,13 +111,34 @@ def get_output_consistency_scale(epoch):
     return ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
+def get_current_class_thresholds(epoch):
+    """
+    Ramp thresholds from a relaxed value (0.5) to target thresholds.
+    """
+    start = 0.5
+    ramp = ramps.sigmoid_rampup(epoch, args.class_thresh_rampup)
+
+    target = torch.tensor(
+        [args.bg_thresh, args.rv_thresh, args.myo_thresh, args.lv_thresh],
+        dtype=torch.float32,
+        device="cuda"
+    )
+    current = start + (target - start) * ramp
+    return current
+
+
 def unpack_outputs(model_out):
-    """
-    Only support current unet_urpc style: 4 outputs
-    """
     if not isinstance(model_out, (tuple, list)) or len(model_out) != 4:
-        raise ValueError("Current train-file-only version expects model to return exactly 4 outputs.")
+        raise ValueError("This train-file-only version expects model to return exactly 4 outputs.")
     return model_out[0], model_out[1], model_out[2], model_out[3]
+
+
+def entropy_minimization_loss(prob):
+    """
+    prob: [B, C, H, W]
+    """
+    ent = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+    return torch.mean(ent)
 
 
 def train(args, snapshot_path):
@@ -193,7 +213,7 @@ def train(args, snapshot_path):
             outputs_aux2_soft = torch.softmax(outputs_aux2, dim=1)
             outputs_aux3_soft = torch.softmax(outputs_aux3, dim=1)
 
-            # ---------------- second noisy-view forward (train-file-only "teacher-like" target) ----------------
+            # ---------------- second noisy-view forward ----------------
             noise = torch.clamp(
                 torch.randn_like(volume_batch) * args.noise_std,
                 -args.noise_clip,
@@ -238,11 +258,12 @@ def train(args, snapshot_path):
             outputs_aux2_u = outputs_aux2_soft[lb:]
             outputs_aux3_u = outputs_aux3_soft[lb:]
 
-            # ---------------- confidence mask ----------------
+            # ---------------- class-aware threshold mask ----------------
             with torch.no_grad():
-                conf_map = torch.max(preds_u, dim=1, keepdim=True)[0]
-                conf_thresh = get_current_conf_threshold(epoch_num)
-                conf_mask = (conf_map > conf_thresh).float()
+                class_thresholds = get_current_class_thresholds(epoch_num)  # [4]
+                pseudo_prob, pseudo_label = torch.max(preds_u, dim=1, keepdim=True)  # [B,1,H,W]
+                threshold_map = class_thresholds[pseudo_label.squeeze(1)].unsqueeze(1)  # [B,1,H,W]
+                conf_mask = (pseudo_prob > threshold_map).float()
                 mask_mean = conf_mask.mean()
                 norm_factor = mask_mean + 1e-6
 
@@ -311,7 +332,7 @@ def train(args, snapshot_path):
                 + consistency_loss_aux3
             ) / 4.0
 
-            # ---------------- dual-view consistency (train file only, no model change) ----------------
+            # ---------------- dual-view consistency ----------------
             outputs_t_u = outputs_t_soft[lb:]
             outputs_aux1_t_u = outputs_aux1_t_soft[lb:]
             outputs_aux2_t_u = outputs_aux2_t_soft[lb:]
@@ -329,6 +350,9 @@ def train(args, snapshot_path):
                 + dual_consistency_aux3
             ) / 4.0
 
+            # ---------------- entropy minimization on unlabeled ----------------
+            entropy_loss = entropy_minimization_loss(preds_u)
+
             # ---------------- dynamic weighting ----------------
             sup_weight = get_supervised_weight(epoch_num, max_epoch)
             out_scale = get_output_consistency_scale(epoch_num)
@@ -338,6 +362,7 @@ def train(args, snapshot_path):
                 sup_weight * supervised_loss
                 + out_scale * consistency_weight * consistency_loss
                 + args.dual_consistency_weight * out_scale * dual_view_loss
+                + args.entropy_weight * entropy_loss
             )
 
             optimizer.zero_grad()
@@ -357,22 +382,27 @@ def train(args, snapshot_path):
             writer.add_scalar("info/supervised_loss", supervised_loss.item(), iter_num)
             writer.add_scalar("info/consistency_loss", consistency_loss.item(), iter_num)
             writer.add_scalar("info/dual_view_loss", dual_view_loss.item(), iter_num)
+            writer.add_scalar("info/entropy_loss", entropy_loss.item(), iter_num)
             writer.add_scalar("info/consistency_weight", consistency_weight, iter_num)
             writer.add_scalar("info/sup_weight", sup_weight, iter_num)
             writer.add_scalar("info/out_scale", out_scale, iter_num)
-            writer.add_scalar("info/conf_thresh", conf_thresh, iter_num)
             writer.add_scalar("info/mask_ratio", mask_mean.item(), iter_num)
             writer.add_scalar("info/loss_ce", loss_ce.item(), iter_num)
             writer.add_scalar("info/loss_dice", loss_dice.item(), iter_num)
+            writer.add_scalar("info/bg_thresh", class_thresholds[0].item(), iter_num)
+            writer.add_scalar("info/rv_thresh", class_thresholds[1].item(), iter_num)
+            writer.add_scalar("info/myo_thresh", class_thresholds[2].item(), iter_num)
+            writer.add_scalar("info/lv_thresh", class_thresholds[3].item(), iter_num)
 
             logging.info(
-                "iter %d | total %.4f | sup %.4f | cons %.4f | dual %.4f | ce %.4f | dice %.4f"
+                "iter %d | total %.4f | sup %.4f | cons %.4f | dual %.4f | ent %.4f | ce %.4f | dice %.4f"
                 % (
                     iter_num,
                     loss.item(),
                     supervised_loss.item(),
                     consistency_loss.item(),
                     dual_view_loss.item(),
+                    entropy_loss.item(),
                     loss_ce.item(),
                     loss_dice.item(),
                 )
