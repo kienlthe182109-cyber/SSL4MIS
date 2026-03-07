@@ -1,14 +1,13 @@
 import argparse
 import os
+import h5py
 import numpy as np
 import torch
-from tqdm import tqdm
 from medpy import metric
 from scipy.ndimage import zoom
-from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from networks.net_factory import net_factory
-from dataloaders.dataset import BaseDataSets
 
 
 parser = argparse.ArgumentParser()
@@ -17,11 +16,13 @@ parser.add_argument('--root_path', type=str,
 parser.add_argument('--exp', type=str,
                     default='ACDC/Uncertainty_Rectified_Pyramid_Consistency')
 parser.add_argument('--model', type=str,
-                    default='unet_urpc', help='model_name')
+                    default='unet_urpc', help='model name')
 parser.add_argument('--num_classes', type=int,
                     default=4, help='output channel of network')
-parser.add_argument('--labeled_num', type=int, default=7)
-parser.add_argument('--patch_size', type=list, default=[256, 256])
+parser.add_argument('--labeled_num', type=int, default=7,
+                    help='number of labeled patients')
+parser.add_argument('--patch_size', type=list, default=[256, 256],
+                    help='patch size used during training')
 FLAGS = parser.parse_args()
 
 
@@ -46,21 +47,21 @@ def calculate_metric_percase(pred, gt):
     dice = metric.binary.dc(pred, gt)
     hd95 = metric.binary.hd95(pred, gt)
     asd = metric.binary.asd(pred, gt)
-
     return dice, hd95, asd
 
 
 def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
-    image = image.squeeze(0).cpu().numpy()
-    label = label.squeeze(0).cpu().numpy()
-
+    """
+    image: numpy array [D, H, W]
+    label: numpy array [D, H, W]
+    """
     prediction = np.zeros_like(label)
 
     for ind in range(image.shape[0]):
         slice_img = image[ind, :, :]
         x, y = slice_img.shape[0], slice_img.shape[1]
 
-        # resize to patch size used in training
+        # resize slice to patch size used in training
         if x != patch_size[0] or y != patch_size[1]:
             slice_resized = zoom(
                 slice_img,
@@ -75,14 +76,14 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
         with torch.no_grad():
             out = net(input_tensor)
 
-            # URPC returns multiple outputs -> use main output
+            # handle multi-output models like URPC
             if isinstance(out, (tuple, list)):
                 out = out[0]
 
             out = torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze(0)
             pred = out.cpu().numpy()
 
-        # resize back to original size
+        # resize prediction back to original size
         if x != patch_size[0] or y != patch_size[1]:
             pred = zoom(
                 pred,
@@ -117,32 +118,35 @@ def Inference(FLAGS):
 
     net.load_state_dict(torch.load(save_mode_path))
     print("init weight from {}".format(save_mode_path))
-
     net.eval()
 
-    # dùng val vì repo này thường không có split test thực
-    db_test = BaseDataSets(
-        base_dir=FLAGS.root_path,
-        split="val"
-    )
+    # ---------------- full dataset from test.list ----------------
+    test_list_path = os.path.join(FLAGS.root_path, "test.list")
+    if not os.path.exists(test_list_path):
+        raise FileNotFoundError(
+            "Không tìm thấy test.list tại: {}. "
+            "Hãy kiểm tra lại thư mục dataset ACDC.".format(test_list_path)
+        )
 
-    print("total {} samples".format(len(db_test)))
+    with open(test_list_path, "r") as f:
+        image_list = [item.strip() for item in f.readlines() if item.strip()]
 
-    if len(db_test) == 0:
-        raise ValueError("No samples found. Please check dataset path and split name.")
+    print("total {} samples".format(len(image_list)))
 
-    testloader = DataLoader(
-        db_test,
-        batch_size=1,
-        shuffle=False,
-        num_workers=1
-    )
+    if len(image_list) == 0:
+        raise ValueError("test.list đang rỗng, không có case nào để test.")
 
     metric_list = 0.0
 
-    for sampled_batch in tqdm(testloader):
-        image = sampled_batch["image"].cuda()
-        label = sampled_batch["label"].cuda()
+    for case in tqdm(image_list):
+        h5_path = os.path.join(FLAGS.root_path, "data", "{}.h5".format(case))
+        if not os.path.exists(h5_path):
+            raise FileNotFoundError("Không tìm thấy file: {}".format(h5_path))
+
+        h5f = h5py.File(h5_path, "r")
+        image = h5f["image"][:]
+        label = h5f["label"][:]
+        h5f.close()
 
         first_metric, second_metric, third_metric = test_single_volume(
             image,
@@ -154,7 +158,7 @@ def Inference(FLAGS):
 
         metric_list += np.array((first_metric, second_metric, third_metric))
 
-    metric_list = metric_list / len(db_test)
+    metric_list = metric_list / len(image_list)
 
     print("Mean metric per class [Dice, HD95, ASD]:")
     print(metric_list)
