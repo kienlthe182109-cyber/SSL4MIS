@@ -1,10 +1,10 @@
 import argparse
 import logging
-import math
 import os
 import random
 import shutil
 import sys
+import math
 
 import numpy as np
 import torch
@@ -18,61 +18,39 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from dataloaders.dataset import BaseDataSets, RandomGenerator, TwoStreamBatchSampler
-from networks.net_factory import net_factory
 from utils import losses, ramps
 from val_2D import test_single_volume_ds
+from networks.net_factory import net_factory
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--root_path", type=str, default="../data/ACDC", help="dataset path")
+parser.add_argument("--root_path", type=str, default="../data/ACDC", help="Name of Experiment")
 parser.add_argument(
     "--exp",
     type=str,
-    default="ACDC/URPC_ClassAware_Entropy",
-    help="experiment name",
+    default="ACDC/Uncertainty_Rectified_Pyramid_Consistency",
+    help="experiment_name",
 )
-parser.add_argument("--model", type=str, default="unet_urpc", help="model name")
-parser.add_argument("--max_iterations", type=int, default=30000, help="maximum iteration number")
-parser.add_argument("--batch_size", type=int, default=24, help="batch size per gpu")
-parser.add_argument("--deterministic", type=int, default=1, help="use deterministic training")
-parser.add_argument("--base_lr", type=float, default=0.01, help="segmentation learning rate")
-parser.add_argument("--patch_size", type=list, default=[256, 256], help="patch size")
+parser.add_argument("--model", type=str, default="unet_urpc", help="model_name")
+parser.add_argument("--max_iterations", type=int, default=30000, help="maximum epoch number to train")
+parser.add_argument("--batch_size", type=int, default=24, help="batch_size per gpu")
+parser.add_argument("--deterministic", type=int, default=1, help="whether use deterministic training")
+parser.add_argument("--base_lr", type=float, default=0.01, help="segmentation network learning rate")
+parser.add_argument("--patch_size", type=list, default=[256, 256], help="patch size of network input")
 parser.add_argument("--seed", type=int, default=1337, help="random seed")
-parser.add_argument("--num_classes", type=int, default=4, help="number of classes")
+parser.add_argument("--num_classes", type=int, default=4, help="output channel of network")
 
-# labeled / unlabeled
-parser.add_argument("--labeled_bs", type=int, default=12, help="labeled batch size")
-parser.add_argument("--labeled_num", type=int, default=7, help="number of labeled patients")
+# label and unlabel
+parser.add_argument("--labeled_bs", type=int, default=12, help="labeled_batch_size per gpu")
+parser.add_argument("--labeled_num", type=int, default=7, help="labeled data")
 
-# consistency
-parser.add_argument("--consistency", type=float, default=0.1, help="maximum consistency weight")
-parser.add_argument("--consistency_rampup", type=float, default=200.0, help="consistency rampup")
-
-# dynamic weighting
-parser.add_argument("--sup_decay", type=float, default=0.3, help="how much supervised weight decays")
-
-# uncertainty penalty
-parser.add_argument("--uncertainty_penalty", type=float, default=0.1, help="weight for variance penalty")
-
-# dual-view consistency
-parser.add_argument("--dual_consistency_weight", type=float, default=0.05, help="weight for noisy-view consistency")
-parser.add_argument("--noise_std", type=float, default=0.1, help="std of gaussian noise for second view")
-parser.add_argument("--noise_clip", type=float, default=0.2, help="clip range for gaussian noise")
-
-# entropy minimization
-parser.add_argument("--entropy_weight", type=float, default=0.005, help="weight for entropy minimization on unlabeled data")
-
-# class-aware thresholding
-parser.add_argument("--bg_thresh", type=float, default=0.8, help="threshold for background")
-parser.add_argument("--rv_thresh", type=float, default=0.7, help="threshold for RV")
-parser.add_argument("--myo_thresh", type=float, default=0.6, help="threshold for MYO")
-parser.add_argument("--lv_thresh", type=float, default=0.7, help="threshold for LV")
-parser.add_argument("--class_thresh_rampup", type=float, default=50.0, help="rampup for class thresholds from relaxed to target")
-
+# costs
+parser.add_argument("--consistency", type=float, default=0.1, help="consistency")
+parser.add_argument("--consistency_rampup", type=float, default=200.0, help="consistency_rampup")
 args = parser.parse_args()
 
 
-def patients_to_slices(dataset, patients_num):
+def patients_to_slices(dataset, patiens_num):
     if "ACDC" in dataset:
         ref_dict = {
             "3": 68,
@@ -95,50 +73,12 @@ def patients_to_slices(dataset, patients_num):
         }
     else:
         raise ValueError("Unknown dataset")
-    return ref_dict[str(patients_num)]
+    return ref_dict[str(patiens_num)]
 
 
 def get_current_consistency_weight(epoch):
-    return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
-
-
-def get_supervised_weight(epoch, max_epoch):
-    progress = min(epoch / max_epoch, 1.0)
-    return 1.0 - args.sup_decay * progress
-
-
-def get_output_consistency_scale(epoch):
-    return ramps.sigmoid_rampup(epoch, args.consistency_rampup)
-
-
-def get_current_class_thresholds(epoch):
-    """
-    Ramp thresholds from a relaxed value (0.5) to target thresholds.
-    """
-    start = 0.5
-    ramp = ramps.sigmoid_rampup(epoch, args.class_thresh_rampup)
-
-    target = torch.tensor(
-        [args.bg_thresh, args.rv_thresh, args.myo_thresh, args.lv_thresh],
-        dtype=torch.float32,
-        device="cuda"
-    )
-    current = start + (target - start) * ramp
-    return current
-
-
-def unpack_outputs(model_out):
-    if not isinstance(model_out, (tuple, list)) or len(model_out) != 4:
-        raise ValueError("This train-file-only version expects model to return exactly 4 outputs.")
-    return model_out[0], model_out[1], model_out[2], model_out[3]
-
-
-def entropy_minimization_loss(prob):
-    """
-    prob: [B, C, H, W]
-    """
-    ent = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-    return torch.mean(ent)
+    # ramp-up nhanh hơn bản gốc
+    return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup / 2.0)
 
 
 def train(args, snapshot_path):
@@ -162,7 +102,7 @@ def train(args, snapshot_path):
 
     total_slices = len(db_train)
     labeled_slice = patients_to_slices(args.root_path, args.labeled_num)
-    print("Total slices: {}, labeled slices: {}".format(total_slices, labeled_slice))
+    print("Total slices is: {}, labeled slices is: {}".format(total_slices, labeled_slice))
 
     labeled_idxs = list(range(0, labeled_slice))
     unlabeled_idxs = list(range(labeled_slice, total_slices))
@@ -185,6 +125,7 @@ def train(args, snapshot_path):
         model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001
     )
 
+    # cải tiến 1: weighted CE
     class_weights = torch.tensor([0.1, 0.3, 0.3, 0.3]).cuda()
     ce_loss = CrossEntropyLoss(weight=class_weights)
     dice_loss = losses.DiceLoss(num_classes)
@@ -203,216 +144,139 @@ def train(args, snapshot_path):
             volume_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            lb = args.labeled_bs
-
-            # ---------------- main forward ----------------
-            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = unpack_outputs(model(volume_batch))
+            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = model(volume_batch)
 
             outputs_soft = torch.softmax(outputs, dim=1)
             outputs_aux1_soft = torch.softmax(outputs_aux1, dim=1)
             outputs_aux2_soft = torch.softmax(outputs_aux2, dim=1)
             outputs_aux3_soft = torch.softmax(outputs_aux3, dim=1)
 
-            # ---------------- second noisy-view forward ----------------
-            noise = torch.clamp(
-                torch.randn_like(volume_batch) * args.noise_std,
-                -args.noise_clip,
-                args.noise_clip,
-            )
-            volume_batch_noise = volume_batch + noise
+            # supervised CE
+            loss_ce = ce_loss(outputs[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+            loss_ce_aux1 = ce_loss(outputs_aux1[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+            loss_ce_aux2 = ce_loss(outputs_aux2[:args.labeled_bs], label_batch[:args.labeled_bs].long())
+            loss_ce_aux3 = ce_loss(outputs_aux3[:args.labeled_bs], label_batch[:args.labeled_bs].long())
 
-            with torch.no_grad():
-                outputs_t, outputs_aux1_t, outputs_aux2_t, outputs_aux3_t = unpack_outputs(model(volume_batch_noise))
-                outputs_t_soft = torch.softmax(outputs_t, dim=1)
-                outputs_aux1_t_soft = torch.softmax(outputs_aux1_t, dim=1)
-                outputs_aux2_t_soft = torch.softmax(outputs_aux2_t, dim=1)
-                outputs_aux3_t_soft = torch.softmax(outputs_aux3_t, dim=1)
+            # supervised Dice
+            loss_dice = dice_loss(outputs_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
+            loss_dice_aux1 = dice_loss(outputs_aux1_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
+            loss_dice_aux2 = dice_loss(outputs_aux2_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
+            loss_dice_aux3 = dice_loss(outputs_aux3_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
 
-            # ---------------- supervised loss ----------------
-            label_l = label_batch[:lb]
+            # cải tiến 2: ưu tiên Dice hơn CE
+            supervised_loss = (
+                0.2 * (loss_ce + loss_ce_aux1 + loss_ce_aux2 + loss_ce_aux3)
+                + 0.8 * (loss_dice + loss_dice_aux1 + loss_dice_aux2 + loss_dice_aux3)
+            ) / 4.0
 
-            loss_ce = ce_loss(outputs[:lb], label_l.long())
-            loss_ce_aux1 = ce_loss(outputs_aux1[:lb], label_l.long())
-            loss_ce_aux2 = ce_loss(outputs_aux2[:lb], label_l.long())
-            loss_ce_aux3 = ce_loss(outputs_aux3[:lb], label_l.long())
-
-            loss_dice = dice_loss(outputs_soft[:lb], label_l.unsqueeze(1))
-            loss_dice_aux1 = dice_loss(outputs_aux1_soft[:lb], label_l.unsqueeze(1))
-            loss_dice_aux2 = dice_loss(outputs_aux2_soft[:lb], label_l.unsqueeze(1))
-            loss_dice_aux3 = dice_loss(outputs_aux3_soft[:lb], label_l.unsqueeze(1))
-
-            ce_sum = loss_ce + loss_ce_aux1 + loss_ce_aux2 + loss_ce_aux3
-            dice_sum = loss_dice + loss_dice_aux1 + loss_dice_aux2 + loss_dice_aux3
-
-            supervised_loss = (0.2 * ce_sum + 0.8 * dice_sum) / 4.0
-
-            # ---------------- ensemble pseudo target ----------------
+            # pseudo target
             preds = (
                 outputs_soft + outputs_aux1_soft + outputs_aux2_soft + outputs_aux3_soft
             ) / 4.0
-            preds = preds.detach()
 
-            preds_u = preds[lb:]
-            outputs_u = outputs_soft[lb:]
-            outputs_aux1_u = outputs_aux1_soft[lb:]
-            outputs_aux2_u = outputs_aux2_soft[lb:]
-            outputs_aux3_u = outputs_aux3_soft[lb:]
+            # variance-aware consistency
+            preds_u = preds[args.labeled_bs:]
 
-            # ---------------- class-aware threshold mask ----------------
-            with torch.no_grad():
-                class_thresholds = get_current_class_thresholds(epoch_num)  # [4]
-                pseudo_prob, pseudo_label = torch.max(preds_u, dim=1, keepdim=True)  # [B,1,H,W]
-                threshold_map = class_thresholds[pseudo_label.squeeze(1)].unsqueeze(1)  # [B,1,H,W]
-                conf_mask = (pseudo_prob > threshold_map).float()
-                mask_mean = conf_mask.mean()
-                norm_factor = mask_mean + 1e-6
-
-            # ---------------- variance-aware output consistency ----------------
             variance_main = torch.sum(
-                kl_distance(torch.log(outputs_u + 1e-8), preds_u),
+                kl_distance(torch.log(outputs_soft[args.labeled_bs:] + 1e-8), preds_u),
                 dim=1,
                 keepdim=True,
             )
             exp_variance_main = torch.exp(-variance_main)
 
             variance_aux1 = torch.sum(
-                kl_distance(torch.log(outputs_aux1_u + 1e-8), preds_u),
+                kl_distance(torch.log(outputs_aux1_soft[args.labeled_bs:] + 1e-8), preds_u),
                 dim=1,
                 keepdim=True,
             )
             exp_variance_aux1 = torch.exp(-variance_aux1)
 
             variance_aux2 = torch.sum(
-                kl_distance(torch.log(outputs_aux2_u + 1e-8), preds_u),
+                kl_distance(torch.log(outputs_aux2_soft[args.labeled_bs:] + 1e-8), preds_u),
                 dim=1,
                 keepdim=True,
             )
             exp_variance_aux2 = torch.exp(-variance_aux2)
 
             variance_aux3 = torch.sum(
-                kl_distance(torch.log(outputs_aux3_u + 1e-8), preds_u),
+                kl_distance(torch.log(outputs_aux3_soft[args.labeled_bs:] + 1e-8), preds_u),
                 dim=1,
                 keepdim=True,
             )
             exp_variance_aux3 = torch.exp(-variance_aux3)
 
-            consistency_dist_main = ((preds_u - outputs_u) ** 2) * conf_mask
-            consistency_dist_aux1 = ((preds_u - outputs_aux1_u) ** 2) * conf_mask
-            consistency_dist_aux2 = ((preds_u - outputs_aux2_u) ** 2) * conf_mask
-            consistency_dist_aux3 = ((preds_u - outputs_aux3_u) ** 2) * conf_mask
+            consistency_dist_main = (preds_u - outputs_soft[args.labeled_bs:]) ** 2
+            consistency_dist_aux1 = (preds_u - outputs_aux1_soft[args.labeled_bs:]) ** 2
+            consistency_dist_aux2 = (preds_u - outputs_aux2_soft[args.labeled_bs:]) ** 2
+            consistency_dist_aux3 = (preds_u - outputs_aux3_soft[args.labeled_bs:]) ** 2
 
             consistency_loss_main = (
-                (torch.mean(consistency_dist_main * exp_variance_main) / norm_factor)
-                / (torch.mean(exp_variance_main) + 1e-8)
-                + args.uncertainty_penalty * torch.mean(variance_main)
-            )
+                torch.mean(consistency_dist_main * exp_variance_main) /
+                (torch.mean(exp_variance_main) + 1e-8)
+            ) + torch.mean(variance_main)
 
             consistency_loss_aux1 = (
-                (torch.mean(consistency_dist_aux1 * exp_variance_aux1) / norm_factor)
-                / (torch.mean(exp_variance_aux1) + 1e-8)
-                + args.uncertainty_penalty * torch.mean(variance_aux1)
-            )
+                torch.mean(consistency_dist_aux1 * exp_variance_aux1) /
+                (torch.mean(exp_variance_aux1) + 1e-8)
+            ) + torch.mean(variance_aux1)
 
             consistency_loss_aux2 = (
-                (torch.mean(consistency_dist_aux2 * exp_variance_aux2) / norm_factor)
-                / (torch.mean(exp_variance_aux2) + 1e-8)
-                + args.uncertainty_penalty * torch.mean(variance_aux2)
-            )
+                torch.mean(consistency_dist_aux2 * exp_variance_aux2) /
+                (torch.mean(exp_variance_aux2) + 1e-8)
+            ) + torch.mean(variance_aux2)
 
             consistency_loss_aux3 = (
-                (torch.mean(consistency_dist_aux3 * exp_variance_aux3) / norm_factor)
-                / (torch.mean(exp_variance_aux3) + 1e-8)
-                + args.uncertainty_penalty * torch.mean(variance_aux3)
-            )
+                torch.mean(consistency_dist_aux3 * exp_variance_aux3) /
+                (torch.mean(exp_variance_aux3) + 1e-8)
+            ) + torch.mean(variance_aux3)
 
             consistency_loss = (
-                consistency_loss_main
-                + consistency_loss_aux1
-                + consistency_loss_aux2
-                + consistency_loss_aux3
+                consistency_loss_main +
+                consistency_loss_aux1 +
+                consistency_loss_aux2 +
+                consistency_loss_aux3
             ) / 4.0
 
-            # ---------------- dual-view consistency ----------------
-            outputs_t_u = outputs_t_soft[lb:]
-            outputs_aux1_t_u = outputs_aux1_t_soft[lb:]
-            outputs_aux2_t_u = outputs_aux2_t_soft[lb:]
-            outputs_aux3_t_u = outputs_aux3_t_soft[lb:]
+            consistency_weight = get_current_consistency_weight(iter_num // 150)
 
-            dual_consistency_main = torch.mean(((outputs_u - outputs_t_u) ** 2) * conf_mask) / norm_factor
-            dual_consistency_aux1 = torch.mean(((outputs_aux1_u - outputs_aux1_t_u) ** 2) * conf_mask) / norm_factor
-            dual_consistency_aux2 = torch.mean(((outputs_aux2_u - outputs_aux2_t_u) ** 2) * conf_mask) / norm_factor
-            dual_consistency_aux3 = torch.mean(((outputs_aux3_u - outputs_aux3_t_u) ** 2) * conf_mask) / norm_factor
-
-            dual_view_loss = (
-                dual_consistency_main
-                + dual_consistency_aux1
-                + dual_consistency_aux2
-                + dual_consistency_aux3
-            ) / 4.0
-
-            # ---------------- entropy minimization on unlabeled ----------------
-            entropy_loss = entropy_minimization_loss(preds_u)
-
-            # ---------------- dynamic weighting ----------------
-            sup_weight = get_supervised_weight(epoch_num, max_epoch)
-            out_scale = get_output_consistency_scale(epoch_num)
-            consistency_weight = get_current_consistency_weight(epoch_num)
-
-            loss = (
-                sup_weight * supervised_loss
-                + out_scale * consistency_weight * consistency_loss
-                + args.dual_consistency_weight * out_scale * dual_view_loss
-                + args.entropy_weight * entropy_loss
-            )
+            loss = supervised_loss + consistency_weight * consistency_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # ---------------- cosine lr ----------------
+            # cải tiến 3: cosine learning rate
             lr_ = base_lr * (1.0 + math.cos(math.pi * iter_num / max_iterations)) / 2.0
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_
 
             iter_num += 1
 
-            # ---------------- logs ----------------
             writer.add_scalar("info/lr", lr_, iter_num)
             writer.add_scalar("info/total_loss", loss.item(), iter_num)
-            writer.add_scalar("info/supervised_loss", supervised_loss.item(), iter_num)
-            writer.add_scalar("info/consistency_loss", consistency_loss.item(), iter_num)
-            writer.add_scalar("info/dual_view_loss", dual_view_loss.item(), iter_num)
-            writer.add_scalar("info/entropy_loss", entropy_loss.item(), iter_num)
-            writer.add_scalar("info/consistency_weight", consistency_weight, iter_num)
-            writer.add_scalar("info/sup_weight", sup_weight, iter_num)
-            writer.add_scalar("info/out_scale", out_scale, iter_num)
-            writer.add_scalar("info/mask_ratio", mask_mean.item(), iter_num)
             writer.add_scalar("info/loss_ce", loss_ce.item(), iter_num)
             writer.add_scalar("info/loss_dice", loss_dice.item(), iter_num)
-            writer.add_scalar("info/bg_thresh", class_thresholds[0].item(), iter_num)
-            writer.add_scalar("info/rv_thresh", class_thresholds[1].item(), iter_num)
-            writer.add_scalar("info/myo_thresh", class_thresholds[2].item(), iter_num)
-            writer.add_scalar("info/lv_thresh", class_thresholds[3].item(), iter_num)
+            writer.add_scalar("info/consistency_loss", consistency_loss.item(), iter_num)
+            writer.add_scalar("info/consistency_weight", consistency_weight, iter_num)
 
             logging.info(
-                "iter %d | total %.4f | sup %.4f | cons %.4f | dual %.4f | ent %.4f | ce %.4f | dice %.4f"
+                "iteration %d : total_loss=%f, ce=%f, dice=%f, cons=%f"
                 % (
                     iter_num,
                     loss.item(),
-                    supervised_loss.item(),
-                    consistency_loss.item(),
-                    dual_view_loss.item(),
-                    entropy_loss.item(),
                     loss_ce.item(),
                     loss_dice.item(),
+                    consistency_loss.item(),
                 )
             )
 
             if iter_num % 20 == 0:
                 image = volume_batch[1, 0:1, :, :]
                 writer.add_image("train/Image", image, iter_num)
+
                 pred_show = torch.argmax(outputs_soft, dim=1, keepdim=True)
                 writer.add_image("train/Prediction", pred_show[1, ...] * 50, iter_num)
+
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image("train/GroundTruth", labs, iter_num)
 
@@ -460,9 +324,10 @@ def train(args, snapshot_path):
                     torch.save(model.state_dict(), save_best)
 
                 logging.info(
-                    "iter %d | val_mean_dice %.4f | val_mean_hd95 %.4f"
+                    "iteration %d : mean_dice=%f mean_hd95=%f"
                     % (iter_num, performance, mean_hd95)
                 )
+
                 model.train()
 
             if iter_num % 3000 == 0:
@@ -503,9 +368,7 @@ if __name__ == "__main__":
     if os.path.exists(snapshot_path + "/code"):
         shutil.rmtree(snapshot_path + "/code")
 
-    shutil.copytree(
-        ".", snapshot_path + "/code", shutil.ignore_patterns([".git", "__pycache__"])
-    )
+    shutil.copytree(".", snapshot_path + "/code", shutil.ignore_patterns([".git", "__pycache__"]))
 
     logging.basicConfig(
         filename=snapshot_path + "/log.txt",
